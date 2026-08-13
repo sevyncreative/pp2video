@@ -33,6 +33,7 @@ AUDIO_FILETYPES = [
 
 TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 TOTAL_RE = re.compile(r"Encoding (\d+(?:\.\d+)?)s video")
+PART_RE = re.compile(r"part (\d+)/(\d+) \(starts at (\d+(?:\.\d+)?)s\)")
 
 
 class App:
@@ -263,6 +264,8 @@ class App:
             return
 
         self.total_seconds = 0.0
+        self.base_seconds = 0.0
+        self.finishing = False
         self.progress.config(value=0)
         self.set_log("")
         self.status_var.set("Working…")
@@ -326,10 +329,19 @@ class App:
         match = TOTAL_RE.search(line)
         if match:
             self.total_seconds = float(match.group(1))
+        match = PART_RE.search(line)
+        if match:
+            self.base_seconds = float(match.group(3))
+        if "Combining parts" in line:
+            # Stitching pass: fast stream copy whose time= restarts from zero.
+            self.finishing = True
+            self.status_var.set("Finishing…")
         match = TIME_RE.search(line)
         if match and self.total_seconds > 0:
+            if self.finishing:
+                return
             h, m, s = match.groups()
-            done = int(h) * 3600 + int(m) * 60 + float(s)
+            done = self.base_seconds + int(h) * 3600 + int(m) * 60 + float(s)
             percent = min(100.0, done / self.total_seconds * 100)
             self.progress.config(value=percent)
             self.status_var.set(f"Encoding… {percent:.0f}%")

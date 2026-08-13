@@ -75,6 +75,12 @@ python pdf2video.py deck.pdf --pages 1-5,10 --background white -r 4k
 
 ## Notes
 
+- Large PDFs are handled efficiently: hard cuts (`-t 0`) encode any number of
+  pages in a single fast pass, and crossfaded decks over 30 slides are encoded
+  in parts and stitched together seamlessly — a 188-page deck is no problem.
+- Only the `ffmpeg` binary is needed (`ffprobe` is not required), so the
+  `imageio-ffmpeg` fallback works out of the box.
+
 - Output is H.264 video + AAC audio in an MP4 with `+faststart`, so it plays
   everywhere (browsers, phones, social platforms).
 - Crossfades are automatically capped so they always fit within the shortest

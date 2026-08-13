@@ -3,9 +3,9 @@
 
 Each page of the PDF becomes a slide in the video. Slides are rendered at the
 target resolution (letterboxed to preserve aspect ratio), shown for a fixed or
-per-slide duration, optionally joined with crossfade transitions, and a music
-track can be layered on top (looped or trimmed to fit, with a fade-out at the
-end).
+per-slide duration, optionally joined with crossfade transitions, and one or
+more music tracks can be layered on top (played in order, looped or trimmed to
+fit, with a fade-out at the end).
 
 Requires: ffmpeg on PATH, and the PyMuPDF package (pip install pymupdf).
 
@@ -13,12 +13,13 @@ Examples:
     python pdf2video.py deck.pdf
     python pdf2video.py deck.pdf -o out.mp4 --duration 4 --music track.mp3
     python pdf2video.py deck.pdf --durations 5,3,3,8 --transition 0.75
-    python pdf2video.py deck.pdf --music track.mp3 --music-volume 0.5 --no-loop-music
+    python pdf2video.py deck.pdf -m intro.mp3 -m main.mp3 --music-volume 0.5
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,13 @@ except ImportError:
         sys.exit("error: PyMuPDF is required — install it with: pip install pymupdf")
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".wma"}
+
+# Decks larger than this are encoded in parts and stitched together: one giant
+# crossfade chain gets slow and can exceed the Windows command-length limit.
+SINGLE_PASS_MAX = 30
+CHUNK_SIZE = 20
+
+DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", re.IGNORECASE)
 
 
 def find_ffmpeg() -> str:
@@ -52,17 +60,19 @@ def find_ffmpeg() -> str:
 
 
 def audio_duration(ffmpeg: str, track: Path) -> float:
-    """Duration of an audio file in seconds, via ffprobe (sits next to ffmpeg)."""
-    ffprobe = shutil.which("ffprobe") or str(Path(ffmpeg).with_name(
-        "ffprobe" + (".exe" if ffmpeg.endswith(".exe") else "")))
+    """Duration of an audio file in seconds, parsed from ffmpeg itself.
+
+    Deliberately avoids ffprobe: some installs (e.g. the imageio-ffmpeg
+    fallback) ship only the ffmpeg binary.
+    """
     result = subprocess.run(
-        [ffprobe, "-v", "error", "-show_entries", "format=duration",
-         "-of", "csv=p=0", str(track)],
-        capture_output=True, text=True)
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
+        [ffmpeg, "-hide_banner", "-i", str(track)], capture_output=True, text=True
+    )
+    match = DURATION_RE.search(result.stderr or "")
+    if not match:
         sys.exit(f"error: could not read duration of {track} — is it a valid audio file?")
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def parse_resolution(value: str) -> tuple[int, int]:
@@ -228,107 +238,204 @@ def render_slides(
     return slides
 
 
-def build_ffmpeg_command(
-    ffmpeg: str,
-    slides: list[Path],
-    durations: list[float],
-    args: argparse.Namespace,
-) -> tuple[list[str], float]:
-    """Assemble the ffmpeg invocation. Returns (command, video duration)."""
-    width, height = args.resolution
-    fade = args.transition if len(slides) > 1 else 0.0
+def compute_fade(args: argparse.Namespace, durations: list[float]) -> float:
+    fade = args.transition if len(durations) > 1 else 0.0
     # A crossfade needs both neighbors on screen; cap it so it fits in the
     # shortest slide.
     if fade > 0:
         fade = min(fade, min(durations) * 0.9)
+    return fade
 
-    total = sum(durations) - fade * (len(slides) - 1)
 
-    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-stats", "-y"]
-
-    # One looping still-image input per slide. Each input runs long enough to
-    # cover its slide plus the crossfade overlap into the next one.
-    for i, (slide, dur) in enumerate(zip(slides, durations)):
-        input_duration = dur + (fade if i < len(slides) - 1 else 0)
-        cmd += ["-loop", "1", "-framerate", str(args.fps), "-t", f"{input_duration:.3f}", "-i", str(slide)]
-
-    # Music playlist: tracks play in order; if looping, repeat the whole
-    # playlist enough times to cover the video, then trim.
-    playlist: list[Path] = []
-    if args.music:
-        playlist = list(args.music)
-        if not args.no_loop_music:
-            playlist_duration = sum(audio_duration(ffmpeg, t) for t in args.music)
-            covered = playlist_duration
-            while 0 < covered < total and len(playlist) < 500:
-                playlist += args.music
-                covered += playlist_duration
-        for track in playlist:
-            cmd += ["-i", str(track)]
-
-    # Video filter graph: scale/pad every slide, then chain xfades (or concat).
-    filters = []
-    scale = (
+def scale_filter(args: argparse.Namespace) -> str:
+    width, height = args.resolution
+    return (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color={args.background},"
         f"setsar=1,format=yuv420p"
     )
-    for i in range(len(slides)):
-        filters.append(f"[{i}:v]{scale}[v{i}]")
 
-    if len(slides) == 1:
+
+def base_cmd(ffmpeg: str) -> list[str]:
+    return [ffmpeg, "-hide_banner", "-loglevel", "error", "-stats", "-y"]
+
+
+def video_codec_args(args: argparse.Namespace) -> list[str]:
+    return ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-r", str(args.fps)]
+
+
+def build_audio(
+    ffmpeg: str,
+    args: argparse.Namespace,
+    total: float,
+    input_index: int,
+) -> tuple[list[str], list[str], str | None]:
+    """Music playlist inputs and filters.
+
+    Tracks play in order; if looping, the whole playlist repeats to cover the
+    video, then is trimmed. Returns (input_args, filter_strings, output_label);
+    input_index is the ffmpeg input number of the first audio file.
+    """
+    if not args.music:
+        return [], [], None
+    playlist = list(args.music)
+    if not args.no_loop_music:
+        playlist_duration = sum(audio_duration(ffmpeg, t) for t in args.music)
+        covered = playlist_duration
+        while 0 < covered < total and len(playlist) < 500:
+            playlist += args.music
+            covered += playlist_duration
+
+    inputs: list[str] = []
+    for track in playlist:
+        inputs += ["-i", str(track)]
+
+    # Normalize every track to the same format so they can be joined,
+    # regardless of each file's codec/sample rate/channel count.
+    filters: list[str] = []
+    normalize = "aformat=channel_layouts=stereo,aresample=44100"
+    for j in range(len(playlist)):
+        filters.append(f"[{input_index + j}:a]{normalize}[a{j}]")
+    if len(playlist) > 1:
+        chain = "".join(f"[a{j}]" for j in range(len(playlist)))
+        filters.append(f"{chain}concat=n={len(playlist)}:v=0:a=1[acat]")
+        joined = "acat"
+    else:
+        joined = "a0"
+
+    audio_filters = [f"atrim=0:{total:.3f}", "asetpts=PTS-STARTPTS"]
+    if args.music_volume != 1.0:
+        audio_filters.append(f"volume={args.music_volume:.3f}")
+    if args.music_fade > 0 and total > args.music_fade:
+        start = total - args.music_fade
+        audio_filters.append(f"afade=t=out:st={start:.3f}:d={args.music_fade:.3f}")
+    filters.append(f"[{joined}]{','.join(audio_filters)}[aout]")
+    return inputs, filters, "aout"
+
+
+def build_concat_cmd(
+    ffmpeg: str,
+    slides: list[Path],
+    durations: list[float],
+    args: argparse.Namespace,
+    list_path: Path,
+    total: float,
+) -> list[str]:
+    """Hard cuts: feed all slides through ffmpeg's concat demuxer in one input.
+
+    Scales to any number of slides without long command lines.
+    """
+    with open(list_path, "w", encoding="utf-8") as fh:
+        fh.write("ffconcat version 1.0\n")
+        for slide, dur in zip(slides, durations):
+            fh.write(f"file '{slide.as_posix()}'\nduration {dur:.3f}\n")
+        # concat-demuxer quirk: repeat the last file so its duration is honored
+        fh.write(f"file '{slides[-1].as_posix()}'\n")
+
+    a_inputs, a_filters, a_label = build_audio(ffmpeg, args, total, 1)
+    cmd = base_cmd(ffmpeg) + ["-f", "concat", "-safe", "0", "-i", str(list_path)]
+    cmd += a_inputs
+    filters = [f"[0:v]{scale_filter(args)}[vout]"] + a_filters
+    cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]"]
+    if a_label:
+        cmd += ["-map", f"[{a_label}]", "-c:a", "aac", "-b:a", "192k"]
+    cmd += video_codec_args(args)
+    cmd += ["-movflags", "+faststart", "-t", f"{total:.3f}", str(args.output)]
+    return cmd
+
+
+def build_xfade_cmd(
+    ffmpeg: str,
+    seg_slides: list[Path],
+    local_durs: list[float],
+    lookahead: Path | None,
+    fade: float,
+    args: argparse.Namespace,
+    out_path: Path,
+    with_audio: bool,
+) -> tuple[list[str], float]:
+    """One crossfade-chained encode over seg_slides.
+
+    `local_durs[i]` is the time slide i owns within this segment (display plus
+    its trailing crossfade). `lookahead` is the next segment's first slide, so
+    the crossfade into it lands at this segment's end; that slide's remaining
+    display time is then owned by the next segment. Returns (cmd, duration).
+    """
+    chain: list[Path] = seg_slides + ([lookahead] if lookahead else [])
+    # Each slide owns local_durs[i] minus the fade-in overlap owned by its
+    # predecessor; the lookahead slide owns nothing here. Either way:
+    seg_total = sum(local_durs) - fade * (len(local_durs) - 1)
+    cmd = base_cmd(ffmpeg)
+
+    # One looping still-image input per slide, long enough to cover its slot
+    # plus the crossfade overlap into the next one.
+    for i, slide in enumerate(seg_slides):
+        extra = fade if i < len(chain) - 1 else 0.0
+        cmd += ["-loop", "1", "-framerate", str(args.fps),
+                "-t", f"{local_durs[i] + extra:.3f}", "-i", str(slide)]
+    if lookahead:
+        cmd += ["-loop", "1", "-framerate", str(args.fps),
+                "-t", f"{fade + 1:.3f}", "-i", str(lookahead)]
+
+    a_inputs, a_filters, a_label = ([], [], None)
+    if with_audio:
+        a_inputs, a_filters, a_label = build_audio(ffmpeg, args, seg_total, len(chain))
+    cmd += a_inputs
+
+    filters = [f"[{i}:v]{scale_filter(args)}[v{i}]" for i in range(len(chain))]
+    if len(chain) == 1:
         last_label = "v0"
-    elif fade > 0:
+    else:
         prev = "v0"
         offset = 0.0
-        for i in range(1, len(slides)):
-            offset += durations[i - 1] - fade
-            label = f"x{i}"
+        for i in range(1, len(chain)):
+            offset += local_durs[i - 1] - fade
             filters.append(
-                f"[{prev}][v{i}]xfade=transition=fade:duration={fade:.3f}:offset={offset:.3f}[{label}]"
+                f"[{prev}][v{i}]xfade=transition=fade:duration={fade:.3f}:offset={offset:.3f}[x{i}]"
             )
-            prev = label
+            prev = f"x{i}"
         last_label = prev
-    else:
-        chain = "".join(f"[v{i}]" for i in range(len(slides)))
-        filters.append(f"{chain}concat=n={len(slides)}:v=1:a=0[vout]")
-        last_label = "vout"
-
-    audio_label = None
-    if playlist:
-        # Normalize every track to the same format so they can be joined,
-        # regardless of each file's codec/sample rate/channel count.
-        normalize = "aformat=channel_layouts=stereo,aresample=44100"
-        for j in range(len(playlist)):
-            filters.append(f"[{len(slides) + j}:a]{normalize}[a{j}]")
-        if len(playlist) > 1:
-            chain = "".join(f"[a{j}]" for j in range(len(playlist)))
-            filters.append(f"{chain}concat=n={len(playlist)}:v=0:a=1[acat]")
-            joined = "acat"
-        else:
-            joined = "a0"
-        audio_filters = [f"atrim=0:{total:.3f}", "asetpts=PTS-STARTPTS"]
-        if args.music_volume != 1.0:
-            audio_filters.append(f"volume={args.music_volume:.3f}")
-        if args.music_fade > 0 and total > args.music_fade:
-            start = total - args.music_fade
-            audio_filters.append(f"afade=t=out:st={start:.3f}:d={args.music_fade:.3f}")
-        filters.append(f"[{joined}]{','.join(audio_filters)}[aout]")
-        audio_label = "aout"
+    filters += a_filters
 
     cmd += ["-filter_complex", ";".join(filters), "-map", f"[{last_label}]"]
-    if audio_label:
-        cmd += ["-map", f"[{audio_label}]", "-c:a", "aac", "-b:a", "192k"]
-    cmd += [
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
-        "-r", str(args.fps),
-        "-movflags", "+faststart",
-        "-t", f"{total:.3f}",
-        str(args.output),
-    ]
-    return cmd, total
+    if a_label:
+        cmd += ["-map", f"[{a_label}]", "-c:a", "aac", "-b:a", "192k"]
+    cmd += video_codec_args(args)
+    if out_path.suffix == ".mp4":
+        cmd += ["-movflags", "+faststart"]
+    cmd += ["-t", f"{seg_total:.3f}", str(out_path)]
+    return cmd, seg_total
+
+
+def build_combine_cmd(
+    ffmpeg: str,
+    seg_files: list[Path],
+    args: argparse.Namespace,
+    list_path: Path,
+    total: float,
+) -> list[str]:
+    """Stitch encoded segments together (stream copy) and add the music."""
+    with open(list_path, "w", encoding="utf-8") as fh:
+        fh.write("ffconcat version 1.0\n")
+        for seg in seg_files:
+            fh.write(f"file '{seg.as_posix()}'\n")
+
+    a_inputs, a_filters, a_label = build_audio(ffmpeg, args, total, 1)
+    cmd = base_cmd(ffmpeg) + ["-f", "concat", "-safe", "0", "-i", str(list_path)]
+    cmd += a_inputs
+    if a_filters:
+        cmd += ["-filter_complex", ";".join(a_filters)]
+    cmd += ["-map", "0:v", "-c:v", "copy"]
+    if a_label:
+        cmd += ["-map", f"[{a_label}]", "-c:a", "aac", "-b:a", "192k"]
+    cmd += ["-movflags", "+faststart", "-t", f"{total:.3f}", str(args.output)]
+    return cmd
+
+
+def run_ffmpeg(cmd: list[str]) -> None:
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        sys.exit(f"error: ffmpeg failed (exit code {result.returncode})")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -346,18 +453,52 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Rendering {len(pages)} slide(s) from {args.pdf.name} "
               f"at {args.resolution[0]}x{args.resolution[1]}...")
 
-    with tempfile.TemporaryDirectory(prefix="pdf2video_") as tmp:
-        slides = render_slides(args.pdf, pages, args.resolution, Path(tmp), args.quiet)
-        cmd, total = build_ffmpeg_command(ffmpeg, slides, durations, args)
+    with tempfile.TemporaryDirectory(prefix="pdf2video_") as tmp_name:
+        tmp = Path(tmp_name)
+        slides = render_slides(args.pdf, pages, args.resolution, tmp, args.quiet)
+        n = len(slides)
+        fade = compute_fade(args, durations)
+        total = sum(durations) - fade * (n - 1)
+
         if not args.quiet:
             music_note = (
                 f" with music from {', '.join(t.name for t in args.music)}"
                 if args.music else ""
             )
             print(f"Encoding {total:.1f}s video{music_note}...")
-        result = subprocess.run(cmd)
-        if result.returncode != 0:
-            sys.exit(f"error: ffmpeg failed (exit code {result.returncode})")
+
+        if fade == 0:
+            run_ffmpeg(build_concat_cmd(
+                ffmpeg, slides, durations, args, tmp / "slides.ffconcat", total))
+        elif n <= SINGLE_PASS_MAX:
+            cmd, _ = build_xfade_cmd(
+                ffmpeg, slides, durations, None, fade, args, args.output, with_audio=True)
+            run_ffmpeg(cmd)
+        else:
+            # Encode in parts (crossfades into the next part included), then
+            # stitch with stream copy and lay the music over the whole video.
+            starts = list(range(0, n, CHUNK_SIZE))
+            seg_files: list[Path] = []
+            base_time = 0.0
+            for k, a in enumerate(starts):
+                b = min(a + CHUNK_SIZE, n) - 1
+                local = [durations[a] - (fade if a > 0 else 0.0)]
+                local += [durations[i] for i in range(a + 1, b + 1)]
+                lookahead = slides[b + 1] if b + 1 < n else None
+                if not args.quiet:
+                    print(f"  part {k + 1}/{len(starts)} (starts at {base_time:.1f}s)")
+                seg = tmp / f"seg_{k:03d}.ts"
+                cmd, seg_total = build_xfade_cmd(
+                    ffmpeg, slides[a:b + 1], local, lookahead, fade, args, seg,
+                    with_audio=False)
+                run_ffmpeg(cmd)
+                seg_files.append(seg)
+                base_time += seg_total
+            if not args.quiet:
+                print("Combining parts..." if not args.music
+                      else "Combining parts and adding music...")
+            run_ffmpeg(build_combine_cmd(
+                ffmpeg, seg_files, args, tmp / "segments.ffconcat", total))
 
     print(f"Done: {args.output} ({total:.1f}s)")
 
