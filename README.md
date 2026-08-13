@@ -21,8 +21,9 @@ fade-out at the end.
 python pdf2video_gui.py
 ```
 
-Opens a window where you pick the PDF, optionally a music track, and the
-output location, then adjust slide timing, crossfades, resolution, music
+Opens a window where you pick the PDF, optionally queue one or more music
+tracks (they play in order; reorder with Move up/down), and choose the output
+location, then adjust slide timing, crossfades, resolution, music
 volume/looping/fade-out, and page selection. A progress bar tracks the encode,
 and "Open folder" jumps to the finished video. The GUI needs only the Python
 standard library (tkinter, bundled with Python on Windows/macOS; on Linux
@@ -48,7 +49,7 @@ python pdf2video.py deck.pdf -o final.mp4 -d 3 -m track.mp3 --music-volume 0.6 -
 | `-o, --output` | `<pdf name>.mp4` | Output video file |
 | `-d, --duration` | `5` | Seconds each slide is shown |
 | `--durations` | — | Per-slide durations, e.g. `5,3,3,8` (overrides `-d`; last value repeats if short) |
-| `-m, --music` | — | Audio file to play over the slideshow (mp3, wav, m4a, ...) |
+| `-m, --music` | — | Audio file to play over the slideshow (mp3, wav, m4a, ...); repeat the flag for a playlist: `-m intro.mp3 -m main.mp3` |
 | `--music-volume` | `1.0` | Music volume multiplier (0.0–2.0) |
 | `--no-loop-music` | off | Don't loop music shorter than the video |
 | `--music-fade` | `2` | Seconds of audio fade-out at the end (`0` to disable) |
@@ -78,5 +79,8 @@ python pdf2video.py deck.pdf --pages 1-5,10 --background white -r 4k
   everywhere (browsers, phones, social platforms).
 - Crossfades are automatically capped so they always fit within the shortest
   slide duration.
-- If the music is longer than the video it's trimmed; if shorter it loops
-  (unless `--no-loop-music` is set). The fade-out is applied either way.
+- Multiple `-m` tracks form a playlist that plays in the order given; tracks
+  with different formats/sample rates are normalized automatically.
+- If the music (or playlist) is longer than the video it's trimmed; if shorter
+  it loops (unless `--no-loop-music` is set). The fade-out is applied either
+  way.

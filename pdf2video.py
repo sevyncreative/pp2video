@@ -51,6 +51,20 @@ def find_ffmpeg() -> str:
         )
 
 
+def audio_duration(ffmpeg: str, track: Path) -> float:
+    """Duration of an audio file in seconds, via ffprobe (sits next to ffmpeg)."""
+    ffprobe = shutil.which("ffprobe") or str(Path(ffmpeg).with_name(
+        "ffprobe" + (".exe" if ffmpeg.endswith(".exe") else "")))
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(track)],
+        capture_output=True, text=True)
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        sys.exit(f"error: could not read duration of {track} — is it a valid audio file?")
+
+
 def parse_resolution(value: str) -> tuple[int, int]:
     presets = {
         "1080p": (1920, 1080),
@@ -96,8 +110,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "(overrides --duration; if fewer values than slides, the last value repeats)",
     )
     parser.add_argument(
-        "-m", "--music", type=Path, default=None,
-        help="audio file to play over the slideshow (mp3, wav, m4a, ...)",
+        "-m", "--music", type=Path, action="append", default=None, metavar="FILE",
+        help="audio file to play over the slideshow (mp3, wav, m4a, ...); "
+             "repeat the flag to queue several tracks that play in order",
     )
     parser.add_argument(
         "--music-volume", type=float, default=1.0,
@@ -135,8 +150,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"PDF not found: {args.pdf}")
     if args.pdf.suffix.lower() in AUDIO_EXTENSIONS:
         parser.error(f"{args.pdf} looks like an audio file — pass the PDF first, music via --music")
-    if args.music is not None and not args.music.is_file():
-        parser.error(f"music file not found: {args.music}")
+    for track in args.music or []:
+        if not track.is_file():
+            parser.error(f"music file not found: {track}")
     if args.duration <= 0:
         parser.error("--duration must be positive")
     if not 0 <= args.music_volume <= 2:
@@ -236,13 +252,19 @@ def build_ffmpeg_command(
         input_duration = dur + (fade if i < len(slides) - 1 else 0)
         cmd += ["-loop", "1", "-framerate", str(args.fps), "-t", f"{input_duration:.3f}", "-i", str(slide)]
 
-    music_index = None
-    if args.music is not None:
-        music_index = len(slides)
-        if args.no_loop_music:
-            cmd += ["-i", str(args.music)]
-        else:
-            cmd += ["-stream_loop", "-1", "-i", str(args.music)]
+    # Music playlist: tracks play in order; if looping, repeat the whole
+    # playlist enough times to cover the video, then trim.
+    playlist: list[Path] = []
+    if args.music:
+        playlist = list(args.music)
+        if not args.no_loop_music:
+            playlist_duration = sum(audio_duration(ffmpeg, t) for t in args.music)
+            covered = playlist_duration
+            while 0 < covered < total and len(playlist) < 500:
+                playlist += args.music
+                covered += playlist_duration
+        for track in playlist:
+            cmd += ["-i", str(track)]
 
     # Video filter graph: scale/pad every slide, then chain xfades (or concat).
     filters = []
@@ -273,14 +295,25 @@ def build_ffmpeg_command(
         last_label = "vout"
 
     audio_label = None
-    if music_index is not None:
+    if playlist:
+        # Normalize every track to the same format so they can be joined,
+        # regardless of each file's codec/sample rate/channel count.
+        normalize = "aformat=channel_layouts=stereo,aresample=44100"
+        for j in range(len(playlist)):
+            filters.append(f"[{len(slides) + j}:a]{normalize}[a{j}]")
+        if len(playlist) > 1:
+            chain = "".join(f"[a{j}]" for j in range(len(playlist)))
+            filters.append(f"{chain}concat=n={len(playlist)}:v=0:a=1[acat]")
+            joined = "acat"
+        else:
+            joined = "a0"
         audio_filters = [f"atrim=0:{total:.3f}", "asetpts=PTS-STARTPTS"]
         if args.music_volume != 1.0:
             audio_filters.append(f"volume={args.music_volume:.3f}")
         if args.music_fade > 0 and total > args.music_fade:
             start = total - args.music_fade
             audio_filters.append(f"afade=t=out:st={start:.3f}:d={args.music_fade:.3f}")
-        filters.append(f"[{music_index}:a]{','.join(audio_filters)}[aout]")
+        filters.append(f"[{joined}]{','.join(audio_filters)}[aout]")
         audio_label = "aout"
 
     cmd += ["-filter_complex", ";".join(filters), "-map", f"[{last_label}]"]
@@ -317,7 +350,10 @@ def main(argv: list[str] | None = None) -> None:
         slides = render_slides(args.pdf, pages, args.resolution, Path(tmp), args.quiet)
         cmd, total = build_ffmpeg_command(ffmpeg, slides, durations, args)
         if not args.quiet:
-            music_note = f" with music from {args.music.name}" if args.music else ""
+            music_note = (
+                f" with music from {', '.join(t.name for t in args.music)}"
+                if args.music else ""
+            )
             print(f"Encoding {total:.1f}s video{music_note}...")
         result = subprocess.run(cmd)
         if result.returncode != 0:

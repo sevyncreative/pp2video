@@ -57,20 +57,29 @@ class App:
         files.columnconfigure(1, weight=1)
 
         self.pdf_var = tk.StringVar()
-        self.music_var = tk.StringVar()
         self.output_var = tk.StringVar()
+        self.music_tracks: list[str] = []
 
         ttk.Label(files, text="PDF slideshow:").grid(row=0, column=0, sticky="w", **pad)
         ttk.Entry(files, textvariable=self.pdf_var).grid(row=0, column=1, sticky="ew", **pad)
         ttk.Button(files, text="Browse…", command=self.pick_pdf).grid(row=0, column=2, **pad)
 
-        ttk.Label(files, text="Music (optional):").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(files, textvariable=self.music_var).grid(row=1, column=1, sticky="ew", **pad)
-        ttk.Button(files, text="Browse…", command=self.pick_music).grid(row=1, column=2, **pad)
+        ttk.Label(files, text="Save video as:").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Entry(files, textvariable=self.output_var).grid(row=1, column=1, sticky="ew", **pad)
+        ttk.Button(files, text="Browse…", command=self.pick_output).grid(row=1, column=2, **pad)
 
-        ttk.Label(files, text="Save video as:").grid(row=2, column=0, sticky="w", **pad)
-        ttk.Entry(files, textvariable=self.output_var).grid(row=2, column=1, sticky="ew", **pad)
-        ttk.Button(files, text="Browse…", command=self.pick_output).grid(row=2, column=2, **pad)
+        ttk.Label(files, text="Music (optional,\nplays in order):").grid(
+            row=2, column=0, sticky="nw", **pad)
+        self.track_list = tk.Listbox(files, height=4, activestyle="dotbox")
+        self.track_list.grid(row=2, column=1, rowspan=4, sticky="nsew", **pad)
+        ttk.Button(files, text="Add…", command=self.add_music).grid(
+            row=2, column=2, sticky="ew", **pad)
+        ttk.Button(files, text="Remove", command=self.remove_music).grid(
+            row=3, column=2, sticky="ew", **pad)
+        ttk.Button(files, text="Move up", command=lambda: self.move_music(-1)).grid(
+            row=4, column=2, sticky="ew", **pad)
+        ttk.Button(files, text="Move down", command=lambda: self.move_music(1)).grid(
+            row=5, column=2, sticky="ew", **pad)
 
         # --- Slides ---
         slides = ttk.LabelFrame(frame, text="Slides", padding=8)
@@ -111,7 +120,7 @@ class App:
         ttk.Scale(music, from_=0, to=200, variable=self.volume_var,
                   command=self.on_volume_change).grid(row=0, column=1, sticky="ew", **pad)
 
-        ttk.Checkbutton(music, text="Loop music to fill the video",
+        ttk.Checkbutton(music, text="Loop playlist to fill the video",
                         variable=self.loop_var).grid(row=1, column=0, columnspan=3, sticky="w", **pad)
 
         ttk.Label(music, text="Fade out (s):").grid(row=2, column=0, sticky="w", **pad)
@@ -156,11 +165,35 @@ class App:
                 self.output_var.set(str(Path(path).with_suffix(".mp4")))
             self.status_var.set("Ready.")
 
-    def pick_music(self) -> None:
-        path = filedialog.askopenfilename(title="Choose music track",
-                                          filetypes=AUDIO_FILETYPES)
-        if path:
-            self.music_var.set(path)
+    def add_music(self) -> None:
+        paths = filedialog.askopenfilenames(title="Choose music track(s)",
+                                            filetypes=AUDIO_FILETYPES)
+        for path in paths:
+            self.music_tracks.append(path)
+            self.track_list.insert("end", Path(path).name)
+
+    def remove_music(self) -> None:
+        selection = self.track_list.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        del self.music_tracks[index]
+        self.track_list.delete(index)
+        if self.music_tracks:
+            self.track_list.selection_set(min(index, len(self.music_tracks) - 1))
+
+    def move_music(self, delta: int) -> None:
+        selection = self.track_list.curselection()
+        if not selection:
+            return
+        i, j = selection[0], selection[0] + delta
+        if not 0 <= j < len(self.music_tracks):
+            return
+        self.music_tracks[i], self.music_tracks[j] = self.music_tracks[j], self.music_tracks[i]
+        self.track_list.delete(i)
+        self.track_list.insert(j, Path(self.music_tracks[j]).name)
+        self.track_list.selection_set(j)
+        self.track_list.see(j)
 
     def pick_output(self) -> None:
         initial = self.output_var.get() or "slideshow.mp4"
@@ -210,12 +243,13 @@ class App:
         if pages:
             cmd += ["--pages", pages]
 
-        music = self.music_var.get().strip()
-        if music:
-            if not Path(music).is_file():
-                messagebox.showerror("Not found", f"Music file not found:\n{music}")
-                return None
-            cmd += ["-m", music, "--music-volume", f"{self.volume_var.get() / 100:.2f}",
+        if self.music_tracks:
+            for track in self.music_tracks:
+                if not Path(track).is_file():
+                    messagebox.showerror("Not found", f"Music file not found:\n{track}")
+                    return None
+                cmd += ["-m", track]
+            cmd += ["--music-volume", f"{self.volume_var.get() / 100:.2f}",
                     "--music-fade", str(fade)]
             if not self.loop_var.get():
                 cmd.append("--no-loop-music")
