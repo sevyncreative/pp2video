@@ -15,7 +15,20 @@ fade-out at the end.
   (or `pip install imageio-ffmpeg` as a fallback)
 - PyMuPDF: `pip install -r requirements.txt`
 
-## Quick start
+## GUI
+
+```bash
+python pdf2video_gui.py
+```
+
+Opens a window where you pick the PDF, optionally a music track, and the
+output location, then adjust slide timing, crossfades, resolution, music
+volume/looping/fade-out, and page selection. A progress bar tracks the encode,
+and "Open folder" jumps to the finished video. The GUI needs only the Python
+standard library (tkinter, bundled with Python on Windows/macOS; on Linux
+install it with e.g. `sudo apt install python3-tk`).
+
+## Command line
 
 ```bash
 # Basic: 5 seconds per slide, output next to the PDF as deck.mp4
